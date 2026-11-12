@@ -21,7 +21,9 @@ import pyautogui as pag
 import pydirectinput as pdi
 import pytesseract
 import win32gui
-from PIL import ImageEnhance, ImageGrab, ImageOps, ImageStat
+import win32ui
+import win32con
+from PIL import Image, ImageEnhance, ImageGrab, ImageOps, ImageStat
 from pynput import keyboard, mouse
 
 ROOT = Path(__file__).resolve().parent
@@ -69,7 +71,7 @@ def validate_config(cfg: dict, hwnd: int, *, execute: bool = False,
         )
     required = ("add_patient", "patient_id", "first_name", "last_name", "ok")
     if execute:
-        required += ("modal_title_roi", "list_first_id_roi")
+        required += ("modal_title_roi", "list_first_id_roi", "input_values_roi")
         if birth:
             required += ("birth",)
         if description:
@@ -89,7 +91,7 @@ def validate_config(cfg: dict, hwnd: int, *, execute: bool = False,
             not (0 <= pt[0] < width and 0 <= pt[1] < height)):
             raise RuntimeError(f"현재 Moonlight 화면 밖이거나 잘못된 좌표: {name}={pt}")
     if execute:
-        for name in ("modal_title_roi", "list_first_id_roi"):
+        for name in ("modal_title_roi", "list_first_id_roi", "input_values_roi"):
             roi = cfg[name]
             if (not isinstance(roi, list) or len(roi) != 4 or
                 any(isinstance(v, bool) or not isinstance(v, int) for v in roi) or
@@ -150,19 +152,34 @@ def relative_point(hwnd: int) -> list[int]:
 
 def click(hwnd: int, point: list[int]) -> None:
     x, y, _, _ = client_rect(hwnd)
-    # Moonlight? ??/?? ?? ????? ????? ????.
-    pag.moveTo(x + point[0], y + point[1])
-    pag.mouseDown()
+    pag.moveTo(x + point[0], y + point[1], _pause=False)
+    time.sleep(0.04)
+    pag.mouseDown(_pause=False)
     try:
-        time.sleep(0.15)
+        time.sleep(0.08)
     finally:
-        pag.mouseUp()
+        pag.mouseUp(_pause=False)
+    time.sleep(0.04)
 
 
 def crop_region(hwnd: int, roi: list[int]):
     x, y, _, _ = client_rect(hwnd)
     left, top, right, bottom = roi
-    return ImageGrab.grab(bbox=(x + left, y + top, x + right, y + bottom), all_screens=True)
+    width, height = right - left, bottom - top
+    screen = win32gui.GetDC(0)
+    source = win32ui.CreateDCFromHandle(screen)
+    target = source.CreateCompatibleDC()
+    bitmap = win32ui.CreateBitmap()
+    try:
+        bitmap.CreateCompatibleBitmap(source, width, height)
+        target.SelectObject(bitmap)
+        target.BitBlt((0, 0), (width, height), source, (x + left, y + top), win32con.SRCCOPY)
+        return Image.frombuffer("RGB", (width, height), bitmap.GetBitmapBits(True), "raw", "BGRX", 0, 1).copy()
+    finally:
+        target.DeleteDC()
+        source.DeleteDC()
+        win32gui.ReleaseDC(0, screen)
+        win32gui.DeleteObject(bitmap.GetHandle())
 
 
 def make_roi(first: list[int], second: list[int]) -> list[int]:
@@ -322,7 +339,7 @@ def next_id(*, start: int = 90001, reserve: bool = False) -> str:
 
 
  
-pdi.PAUSE = 0.01
+pdi.PAUSE = 0.002
 
 
 def type_text(
@@ -331,21 +348,17 @@ def type_text(
     value: str,
     *,
     interval: float,
+    next_field: bool = False,
 ) -> None:
-    # 입력 필드 활성화
-    click(hwnd, point)
-    time.sleep(0.3)
-
-    # 입력 포커스 확정
-    click(hwnd, point)
-    time.sleep(0.2)
-
-    # 기존 입력값 삭제
-    pdi.press("end")
-    pdi.press("backspace", presses=25, interval=0.01)
-    time.sleep(0.1)
-
-    # 새 값 입력
+    if next_field:
+        pdi.press("tab")
+        time.sleep(0.08)
+    else:
+        click(hwnd, point)
+        time.sleep(0.1)
+    if not next_field:
+        pdi.press("end")
+        pdi.press("backspace", presses=25, interval=0.002)
     for char in value:
         if "A" <= char <= "Z":
             pdi.keyDown("shift")
@@ -353,28 +366,16 @@ def type_text(
                 pdi.press(char.lower())
             finally:
                 pdi.keyUp("shift")
-        elif char == " ":
-            pdi.press("space")
         else:
-            pdi.press(char.lower())
-
+            pdi.press("space" if char == " " else char.lower())
         time.sleep(interval)
 
-    time.sleep(0.1)
-
-
-
- 
 
 
 def keypad_visible(hwnd: int, point: list[int]) -> bool:
-    # ?? ?? ??? ?? ??? ?? ???? ????.
-    x, y, _, _ = client_rect(hwnd)
-    probe = ImageGrab.grab(
-        bbox=(x + point[0] - 40, y + point[1] - 5,
-              x + point[0] - 20, y + point[1] + 5),
-        all_screens=True,
-    ).convert("L")
+    # Sample the bright keypad toolbar beside its close button.
+    probe = crop_region(hwnd, [point[0] - 40, point[1] - 5,
+                               point[0] - 20, point[1] + 5]).convert("L")
     return ImageStat.Stat(probe).mean[0] > 150
 
 
@@ -383,17 +384,10 @@ def dismiss_keypad(hwnd: int, cfg: dict) -> None:
     for _ in range(3):
         if not keypad_visible(hwnd, point):
             return
-        x, y, _, _ = client_rect(hwnd)
-        # ?? ???? ?? ??? ???? ??? ??? ????.
-        pag.moveTo(x + point[0], y + point[1])
-        pag.mouseDown()
-        try:
-            time.sleep(0.15)
-        finally:
-            pag.mouseUp()
-        time.sleep(0.5)
+        click(hwnd, point)
+        time.sleep(0.12)
     if keypad_visible(hwnd, point):
-        raise RuntimeError("??? ?? ??: ?? ?? ??? ?? ??? ?????")
+        raise RuntimeError("Keypad did not close after 3 attempts; check its close-button coordinates")
 
 
 
@@ -404,6 +398,7 @@ def input_test(hwnd: int) -> None:
     timing = get_timing(cfg)
 
     if win32gui.GetForegroundWindow() != hwnd:
+        pag.press("alt")
         win32gui.SetForegroundWindow(hwnd)
         time.sleep(0.3)
     if win32gui.GetForegroundWindow() != hwnd:
@@ -437,7 +432,7 @@ def run(hwnd: int, args) -> None:
         description=args.description,
     )
 
-    pag.PAUSE = timing["action_interval"]
+    pag.PAUSE = 0.01
 
     timeout = (
         args.timeout
@@ -465,6 +460,7 @@ def run(hwnd: int, args) -> None:
 
     # Moonlight 활성화
     if win32gui.GetForegroundWindow() != hwnd:
+        pag.press("alt")
         win32gui.SetForegroundWindow(hwnd)
         time.sleep(timing["action_interval"])
 
@@ -513,6 +509,7 @@ def run(hwnd: int, args) -> None:
             cfg["first_name"],
             args.first_name,
             interval=timing["typing_interval"],
+            next_field=True,
         )
 
         # STEP 4. Last Name
@@ -522,6 +519,7 @@ def run(hwnd: int, args) -> None:
             cfg["last_name"],
             args.last_name,
             interval=timing["typing_interval"],
+            next_field=True,
         )
 
         # STEP 5. Birth
@@ -544,8 +542,8 @@ def run(hwnd: int, args) -> None:
 
         # STEP 7. Keypad 닫기
         print("[7] Keypad 닫기")
+        time.sleep(0.02)
         dismiss_keypad(hwnd, cfg)
-        time.sleep(0.5)
 
         # STEP 8. Physician
         if cfg.get("physician_option") is not None:
@@ -557,7 +555,11 @@ def run(hwnd: int, args) -> None:
         # STEP 9. OK
         print("[9] OK 클릭")
         dismiss_keypad(hwnd, cfg)
-        time.sleep(0.5)
+        actual = ocr(hwnd, cfg["input_values_roi"])
+        expected = f"{pid} {args.first_name} {args.last_name}"
+        actual = re.sub(r"(?<=\d)[|\]](?=\s)", "", actual)
+        if " ".join(actual.split()) != expected:
+            raise RuntimeError(f"Input mismatch: {actual!r} != {expected!r}")
         click(hwnd, cfg["ok"])
 
         # STEP 10. OCR 등록 결과 확인
@@ -567,19 +569,14 @@ def run(hwnd: int, args) -> None:
         observations = []
 
         while time.monotonic() < end:
-            if not contains_modal_title(hwnd, cfg):
-                actual_id = ocr(
-                    hwnd,
-                    cfg["list_first_id_roi"],
-                    digits_only=True,
-                )
-
-                observations.append(actual_id)
-
-                if actual_id == pid:
-                    status = "SUCCESS"
-                    reason = "Patient ID OCR 일치"
-                    break
+            # The list ID ROI is occluded by the modal. An exact reserved ID
+            # match here verifies both dismissal and the saved patient.
+            actual_id = ocr(hwnd, cfg["list_first_id_roi"], digits_only=True)
+            observations.append(actual_id)
+            if actual_id == pid:
+                status = "SUCCESS"
+                reason = "Patient ID OCR match"
+                break
 
             time.sleep(timing["ocr_poll_interval"])
 

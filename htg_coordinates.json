@@ -1,24 +1,64 @@
-
 {
-  "dismiss_keypad": [1179, 388],
-  "client_size": [1280, 720],
-  "add_patient": [1044, 95],
-  "patient_id": [292, 122],
-  "first_name": [606, 119],
-  "last_name": [882, 123],
-  "physician": [824, 215],
-  "physician_option": [825, 258],
-  "ok": [1009, 384],
-
-  "modal_title_roi": [125, 12, 275, 45],
-  "list_first_id_roi": [180, 193, 335, 233],
-
+  "dismiss_keypad": [
+    1179,
+    388
+  ],
+  "client_size": [
+    1280,
+    720
+  ],
+  "add_patient": [
+    1044,
+    95
+  ],
+  "patient_id": [
+    292,
+    122
+  ],
+  "first_name": [
+    606,
+    119
+  ],
+  "last_name": [
+    882,
+    123
+  ],
+  "physician": [
+    824,
+    215
+  ],
+  "physician_option": [
+    825,
+    258
+  ],
+  "ok": [
+    1009,
+    384
+  ],
+  "modal_title_roi": [
+    125,
+    12,
+    275,
+    45
+  ],
+  "list_first_id_roi": [
+    180,
+    193,
+    335,
+    233
+  ],
   "timing": {
     "action_interval": 0.1,
-    "typing_interval": 0.01,
-    "dropdown_interval": 0.5,
-    "ocr_poll_interval": 0.5,
+    "typing_interval": 0.002,
+    "dropdown_interval": 0.3,
+    "ocr_poll_interval": 0.1,
     "modal_timeout": 10.0,
     "registration_timeout": 15.0
-  }
+  },
+  "input_values_roi": [
+    125,
+    101,
+    1081,
+    149
+  ]
 }
