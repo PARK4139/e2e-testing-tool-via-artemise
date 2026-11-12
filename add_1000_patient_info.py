@@ -420,7 +420,7 @@ def screenshot_client(hwnd: int, path: Path) -> None:
 
 
  
-def run(hwnd: int, args) -> None:
+def run(hwnd: int, args) -> dict | None:
     cfg = load_config(hwnd)
     timing = get_timing(cfg)
 
@@ -473,11 +473,22 @@ def run(hwnd: int, args) -> None:
     )
 
     began = time.monotonic()
+    stage_times = {}
+    stage_started = began
+    stage_name = "setup"
+
+    def begin_stage(name):
+        nonlocal stage_started, stage_name
+        now = time.monotonic()
+        stage_times[stage_name] = round(now - stage_started, 4)
+        stage_started, stage_name = now, name
+
     status = "UNKNOWN"
     reason = ""
     actual_id = ""
 
     try:
+        begin_stage('open_modal')
         # STEP 1. Add Patient
         print("[1] Add Patient 클릭")
 
@@ -493,6 +504,7 @@ def run(hwnd: int, args) -> None:
             )
 
         
+        begin_stage('patient_id')
         # STEP 2. Patient ID
         print(f"[2] Patient ID: {pid}")
         type_text(
@@ -502,6 +514,7 @@ def run(hwnd: int, args) -> None:
             interval=timing["typing_interval"],
         )
 
+        begin_stage('first_name')
         # STEP 3. First Name
         print(f"[3] First Name: {args.first_name}")
         type_text(
@@ -512,6 +525,7 @@ def run(hwnd: int, args) -> None:
             next_field=True,
         )
 
+        begin_stage('last_name')
         # STEP 4. Last Name
         print(f"[4] Last Name: {args.last_name}")
         type_text(
@@ -522,6 +536,7 @@ def run(hwnd: int, args) -> None:
             next_field=True,
         )
 
+        begin_stage('birth')
         # STEP 5. Birth
         if args.birth:
             type_text(
@@ -531,6 +546,7 @@ def run(hwnd: int, args) -> None:
                 interval=timing["typing_interval"],
             )
 
+        begin_stage('description')
         # STEP 6. Description
         if args.description:
             type_text(
@@ -540,11 +556,13 @@ def run(hwnd: int, args) -> None:
                 interval=timing["typing_interval"],
             )
 
+        begin_stage('dismiss_keypad')
         # STEP 7. Keypad 닫기
         print("[7] Keypad 닫기")
         time.sleep(0.02)
         dismiss_keypad(hwnd, cfg)
 
+        begin_stage('physician')
         # STEP 8. Physician
         if cfg.get("physician_option") is not None:
             print("[8] Physician 선택")
@@ -552,6 +570,7 @@ def run(hwnd: int, args) -> None:
             time.sleep(timing["dropdown_interval"])
             click(hwnd, cfg["physician_option"])
 
+        begin_stage('pre_save_validation')
         # STEP 9. OK
         print("[9] OK 클릭")
         dismiss_keypad(hwnd, cfg)
@@ -560,8 +579,10 @@ def run(hwnd: int, args) -> None:
         actual = re.sub(r"(?<=\d)[|\]](?=\s)", "", actual)
         if " ".join(actual.split()) != expected:
             raise RuntimeError(f"Input mismatch: {actual!r} != {expected!r}")
+        begin_stage("save_click")
         click(hwnd, cfg["ok"])
 
+        begin_stage('verify_saved_id')
         # STEP 10. OCR 등록 결과 확인
         print("[10] OCR 등록 결과 확인")
 
@@ -597,6 +618,7 @@ def run(hwnd: int, args) -> None:
         print(f"ERROR: {reason}")
 
     finally:
+        begin_stage("logging")
         if status != "SUCCESS":
             path = (
                 ROOT
@@ -616,6 +638,7 @@ def run(hwnd: int, args) -> None:
             "last_name": args.last_name,
             "result": status,
             "actual_ocr_id": actual_id,
+            "stages_sec": stage_times,
             "duration_sec": round(
                 time.monotonic() - began,
                 2,
@@ -634,6 +657,55 @@ def run(hwnd: int, args) -> None:
         )
 
         print(f"실행 로그: {RUNS_FILE}")
+
+    return record_data
+
+
+def ask_patient_count() -> int:
+    while True:
+        try:
+            count = int(input("등록할 환자 수 n: "))
+            if count > 0:
+                return count
+        except ValueError:
+            pass
+        print("1 이상의 정수를 입력하세요.")
+
+
+def run_batch(hwnd: int, args, count: int) -> dict:
+    first_id = int(next_id(start=args.id_start))
+    if first_id + count - 1 > 99999:
+        raise RuntimeError("요청 인원이 남은 5자리 Patient ID 범위를 초과합니다.")
+    print(f"등록 계획: {count}명 / ID {first_id:05d} ~ {first_id + count - 1:05d}")
+    if not args.execute:
+        run(hwnd, args)
+        return {"requested": count, "attempted": 0, "success": 0, "preview": True}
+
+    started = time.monotonic()
+    results = []
+    try:
+        for index in range(count):
+            print(f"\n===== 환자 등록 {index + 1}/{count} =====")
+            result = run(hwnd, args)
+            results.append(result)
+            if result is None or result["result"] != "SUCCESS":
+                print("등록 성공을 확인하지 못해 연속 등록을 중단합니다.")
+                break
+    finally:
+        elapsed = time.monotonic() - started
+        success = sum(item is not None and item["result"] == "SUCCESS" for item in results)
+        summary = {
+            "requested": count,
+            "attempted": len(results),
+            "success": success,
+            "completed": success == count,
+            "total_sec": round(elapsed, 2),
+            "average_success_sec": round(sum(item["duration_sec"] for item in results
+                if item is not None and item["result"] == "SUCCESS") / success, 2) if success else None,
+        }
+        log_jsonl(ROOT / "htg_batch_results.jsonl", summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return summary
 
 
 def record(hwnd: int, *, capture_text: bool = False) -> None:
@@ -715,7 +787,7 @@ def screen(hwnd: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HTG Moonlight 환자 1명 등록 자동화")
+    parser = argparse.ArgumentParser(description="HTG Moonlight 환자 n명 등록 자동화")
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("calibrate", help="기존 수동 좌표 보정 (선택 사항)")
     sub.add_parser("screen", help="Moonlight 클라이언트 영역 캡처 및 크기 확인")
@@ -723,7 +795,7 @@ def main() -> None:
     recorder = sub.add_parser("record", help="수동 등록 1회 조작 이벤트 기록")
     recorder.add_argument("--capture-text", action="store_true", help="합성 테스트 데이터만 입력할 때 사용")
     sub.add_parser("analyze", help="최신 수동 등록 로그의 클릭 순서 분석")
-    runner = sub.add_parser("run", help="환자 1명 등록 및 OCR 검증")
+    runner = sub.add_parser("run", help="input()으로 인원수를 받아 순차 등록 및 OCR 검증")
     runner.add_argument("--execute", action="store_true", help="실제 등록 실행 (미지정 시 PREVIEW)")
     runner.add_argument("--id-start", type=int, default=90001, help="독립 테스트 ID 시작값, 기본 90001")
     runner.add_argument("--first-name", default="AUTO", help="합성 테스트 이름")
@@ -732,6 +804,7 @@ def main() -> None:
     runner.add_argument("--description", default="", help="미지정 시 UI 기본값 유지")
     runner.add_argument("--timeout", type=float, default=None, help="미지정 시 JSON timing.registration_timeout")
     args = parser.parse_args()
+    count = ask_patient_count() if args.mode == "run" else None
     hwnd = find_window()
     if args.mode == "calibrate":
         calibrate(hwnd)
@@ -744,7 +817,7 @@ def main() -> None:
     elif args.mode == "analyze":
         analyze(hwnd)
     elif args.mode == "run":
-        run(hwnd, args)
+        run_batch(hwnd, args, count)
 
 
 if __name__ == "__main__":
