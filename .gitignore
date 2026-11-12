@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+uv.exe
+htg_*.png
+htg_*.jsonl
+htg_patient_id_state.json

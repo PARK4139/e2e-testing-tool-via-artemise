@@ -1,0 +1,12 @@
+[project]
+name = "add-1000-patient-info"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=13.0.0",
+    "pyautogui>=0.9.54",
+    "pydirectinput>=1.0.4",
+    "pynput>=1.8.2",
+    "pytesseract>=0.3.13",
+    "pywin32>=312",
+]
