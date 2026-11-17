@@ -33,6 +33,10 @@ EVENTS_FILE = ROOT / "htg_manual_events.jsonl"
 RUNS_FILE = ROOT / "htg_run_results.jsonl"
 WINDOW_KEYWORD = "Moonlight"
 
+
+class RetryableSetupError(RuntimeError):
+    """The attempt failed before reserving an ID or submitting a patient."""
+
 pag.FAILSAFE = True  # 마우스를 주 화면 왼쪽 위 모서리로 옮기면 중단
 DEFAULT_TIMING = {
     "action_interval": 0.2,
@@ -71,7 +75,7 @@ def validate_config(cfg: dict, hwnd: int, *, execute: bool = False,
         )
     required = ("add_patient", "patient_id", "first_name", "last_name", "ok")
     if execute:
-        required += ("modal_title_roi", "list_first_id_roi", "input_values_roi")
+        required += ("modal_title_roi", "list_first_id_roi", "input_values_roi", "cancel", "list_title_roi")
         if birth:
             required += ("birth",)
         if description:
@@ -82,7 +86,7 @@ def validate_config(cfg: dict, hwnd: int, *, execute: bool = False,
     if missing:
         raise RuntimeError(f"htg_coordinates.json 누락: {', '.join(missing)}")
     for name in ("add_patient", "patient_id", "first_name", "last_name", "ok",
-                 "birth", "description", "physician", "physician_option", "dismiss_keypad"):
+                 "birth", "description", "physician", "physician_option", "dismiss_keypad", "cancel"):
         pt = cfg.get(name)
         if pt is None:
             continue
@@ -91,7 +95,7 @@ def validate_config(cfg: dict, hwnd: int, *, execute: bool = False,
             not (0 <= pt[0] < width and 0 <= pt[1] < height)):
             raise RuntimeError(f"현재 Moonlight 화면 밖이거나 잘못된 좌표: {name}={pt}")
     if execute:
-        for name in ("modal_title_roi", "list_first_id_roi", "input_values_roi"):
+        for name in ("modal_title_roi", "list_first_id_roi", "input_values_roi", "list_title_roi"):
             roi = cfg[name]
             if (not isinstance(roi, list) or len(roi) != 4 or
                 any(isinstance(v, bool) or not isinstance(v, int) for v in roi) or
@@ -216,6 +220,11 @@ def ocr(hwnd: int, roi: list[int], *, digits_only: bool = False) -> str:
     return re.sub(r"\D", "", value) if digits_only else value.strip()
 
 
+def ocr_patient_id(hwnd: int, roi: list[int], pid: str) -> str:
+    """Read the complete ID when a letter prefix is present."""
+    return ocr(hwnd, roi, digits_only=pid.isdigit())
+
+
 def contains_modal_title(hwnd: int, cfg: dict) -> bool:
     value = ocr(hwnd, cfg["modal_title_roi"])
     return "NEWPATIENT" in re.sub(r"[^A-Z]", "", value.upper())
@@ -333,8 +342,8 @@ def next_id(*, start: int = 90001, reserve: bool = False) -> str:
     if candidate > 99999:
         raise RuntimeError("설정한 5자리 Patient ID 테스트 범위 소진")
     if reserve:
-        # 실행 시작 전 선점: 크래시/재시도 시 동일 ID 재사용 금지
-        write_json(STATE_FILE, {"last_reserved": candidate})
+        # 새 환자용 ID만 선점한다. 배치 내 실패 재시도는 배정한 ID를 유지한다.
+        write_json(STATE_FILE, {"last_reserved": candidate, "id_start": start})
     return f"{candidate:05d}"
 
 
@@ -420,7 +429,7 @@ def screenshot_client(hwnd: int, path: Path) -> None:
 
 
  
-def run(hwnd: int, args) -> dict | None:
+def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
     cfg = load_config(hwnd)
     timing = get_timing(cfg)
 
@@ -440,7 +449,7 @@ def run(hwnd: int, args) -> dict | None:
         else timing["registration_timeout"]
     )
 
-    candidate = next_id(start=args.id_start)
+    candidate = patient_id if patient_id is not None else getattr(args, "id_prefix", "") + next_id(start=args.id_start)
 
     print(
         f"\n실행 계획: ID={candidate}, "
@@ -460,14 +469,19 @@ def run(hwnd: int, args) -> dict | None:
 
     # Moonlight 활성화
     if win32gui.GetForegroundWindow() != hwnd:
-        pag.press("alt")
-        win32gui.SetForegroundWindow(hwnd)
+        try:
+            pag.press("alt")
+            win32gui.SetForegroundWindow(hwnd)
+        except pag.FailSafeException:
+            raise
+        except Exception as exc:
+            raise RetryableSetupError(f"Moonlight activation failed: {exc}") from exc
         time.sleep(timing["action_interval"])
 
     if win32gui.GetForegroundWindow() != hwnd:
-        raise RuntimeError("Moonlight 창 활성화 실패")
+        raise RetryableSetupError("Moonlight 창 활성화 실패")
 
-    pid = next_id(
+    pid = patient_id if patient_id is not None else getattr(args, "id_prefix", "") + next_id(
         start=args.id_start,
         reserve=True,
     )
@@ -486,6 +500,7 @@ def run(hwnd: int, args) -> dict | None:
     status = "UNKNOWN"
     reason = ""
     actual_id = ""
+    save_attempted = False
 
     try:
         begin_stage('open_modal')
@@ -580,6 +595,7 @@ def run(hwnd: int, args) -> dict | None:
         if " ".join(actual.split()) != expected:
             raise RuntimeError(f"Input mismatch: {actual!r} != {expected!r}")
         begin_stage("save_click")
+        save_attempted = True
         click(hwnd, cfg["ok"])
 
         begin_stage('verify_saved_id')
@@ -592,7 +608,7 @@ def run(hwnd: int, args) -> dict | None:
         while time.monotonic() < end:
             # The list ID ROI is occluded by the modal. An exact reserved ID
             # match here verifies both dismissal and the saved patient.
-            actual_id = ocr(hwnd, cfg["list_first_id_roi"], digits_only=True)
+            actual_id = ocr_patient_id(hwnd, cfg["list_first_id_roi"], pid)
             observations.append(actual_id)
             if actual_id == pid:
                 status = "SUCCESS"
@@ -638,6 +654,7 @@ def run(hwnd: int, args) -> dict | None:
             "last_name": args.last_name,
             "result": status,
             "actual_ocr_id": actual_id,
+            "save_attempted": save_attempted,
             "stages_sec": stage_times,
             "duration_sec": round(
                 time.monotonic() - began,
@@ -672,33 +689,150 @@ def ask_patient_count() -> int:
         print("1 이상의 정수를 입력하세요.")
 
 
+def validate_id_prefix(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9]*", value, flags=re.ASCII):
+        raise ValueError("ID prefix must contain only ASCII letters and digits.")
+    return value
+
+
+def ask_id_prefix() -> str:
+    while True:
+        try:
+            return validate_id_prefix(input("Patient ID prefix (Enter for none): ").strip())
+        except ValueError as exc:
+            print(exc)
+
+
+def ask_restart_ids() -> bool:
+    while True:
+        answer = input("ID를 00000부터 다시 시작할까요? [y/N]: ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+        print("y 또는 n을 입력하세요.")
+
+
+def recover_registration(hwnd: int, cfg: dict, result: dict) -> str:
+    """Return SUCCESS, RETRY, or WAIT without creating another patient."""
+    if win32gui.GetForegroundWindow() != hwnd:
+        pag.press("alt")
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(get_timing(cfg)["action_interval"])
+    if win32gui.GetForegroundWindow() != hwnd:
+        return "WAIT"
+    pid = result.get("patient_id")
+    if pid and ocr_patient_id(hwnd, cfg["list_first_id_roi"], pid) == pid:
+        return "SUCCESS"
+    if contains_modal_title(hwnd, cfg):
+        dismiss_keypad(hwnd, cfg)
+        if result.get("save_attempted", False):
+            # Retry submission of the same verified ID, never allocate a second
+            # ID while an earlier save is unresolved.
+            actual = ocr(hwnd, cfg["input_values_roi"])
+            actual = re.sub(r"(?<=\d)[|\]](?=\s)", "", actual)
+            expected = f"{pid} {result['first_name']} {result['last_name']}"
+            if " ".join(actual.split()) != expected:
+                return "WAIT"
+            click(hwnd, cfg["ok"])
+            saved = wait_until(
+                lambda: ocr_patient_id(hwnd, cfg["list_first_id_roi"], pid) == pid,
+                timeout=get_timing(cfg)["registration_timeout"], interval=0.1,
+            )
+            return "SUCCESS" if saved else "WAIT"
+        click(hwnd, cfg["cancel"])
+        if not wait_until(lambda: not contains_modal_title(hwnd, cfg),
+                          timeout=get_timing(cfg)["modal_timeout"], interval=0.2):
+            return "WAIT"
+        if pid and ocr_patient_id(hwnd, cfg["list_first_id_roi"], pid) == pid:
+            return "SUCCESS"
+        # A pre-save failure can retry the same reserved ID after Cancel.
+        # A submitted save stays unresolved until its ID can be confirmed.
+    title = ocr(hwnd, cfg["list_title_roi"])
+    on_list = "PATIENTLIST" in re.sub(r"[^A-Z]", "", title.upper())
+    if on_list and not result.get("save_attempted", False):
+        return "RETRY"
+    return "WAIT"
+
+
 def run_batch(hwnd: int, args, count: int) -> dict:
-    first_id = int(next_id(start=args.id_start))
+    restart = getattr(args, "restart_ids", False)
+    if restart:
+        args.id_start = 0
+    prefix = validate_id_prefix(getattr(args, "id_prefix", ""))
+    first_id = 0 if restart else int(next_id(start=args.id_start))
     if first_id + count - 1 > 99999:
         raise RuntimeError("요청 인원이 남은 5자리 Patient ID 범위를 초과합니다.")
-    print(f"등록 계획: {count}명 / ID {first_id:05d} ~ {first_id + count - 1:05d}")
+    print(f"등록 목표: 성공 {count}명 / 시작 ID {prefix}{first_id:05d} (실패 시 동일 ID 재시도)")
     if not args.execute:
-        run(hwnd, args)
+        run(hwnd, args, patient_id=f"{prefix}{first_id:05d}")
         return {"requested": count, "attempted": 0, "success": 0, "preview": True}
 
+    cfg = load_config(hwnd)
+    validate_config(cfg, hwnd, execute=True, birth=args.birth, description=args.description)
+    setup_ocr()
+    if restart:
+        write_json(STATE_FILE, {"last_reserved": -1, "id_start": 0})
     started = time.monotonic()
     results = []
+    success = 0
+    recovery_checks = 0
+    current_id = None
     try:
-        for index in range(count):
-            print(f"\n===== 환자 등록 {index + 1}/{count} =====")
-            result = run(hwnd, args)
+        while success < count:
+            # Reserve once per objective patient, never once per retry.
+            if current_id is None:
+                current_id = prefix + next_id(start=args.id_start, reserve=True)
+            print(f"\n===== 등록 성공 {success}/{count} / 시도 {len(results) + 1} =====")
+            try:
+                result = run(hwnd, args, patient_id=current_id)
+            except pag.FailSafeException:
+                raise
+            except RetryableSetupError as exc:
+                result = {"result": "FAIL", "duration_sec": 0,
+                          "save_attempted": False, "reason": str(exc),
+                          "patient_id": current_id}
+            if result is None:
+                raise RuntimeError("실행 결과가 없어 중단합니다.")
             results.append(result)
-            if result is None or result["result"] != "SUCCESS":
-                print("등록 성공을 확인하지 못해 연속 등록을 중단합니다.")
+            if result["result"] == "SUCCESS":
+                success += 1
+                current_id = None
+                continue
+            if getattr(args, "stop_on_failure", False):
                 break
+            print("실패 복구·등록 여부 확인 후 재시도합니다. Ctrl+C로 중단할 수 있습니다.")
+            recovery_started = time.monotonic()
+            while True:
+                time.sleep(getattr(args, "retry_delay", 1.0))
+                recovery_checks += 1
+                try:
+                    outcome = recover_registration(hwnd, cfg, result)
+                except pag.FailSafeException:
+                    raise
+                except Exception as exc:
+                    print(f"복구 재시도: {exc}")
+                    continue
+                if outcome == "SUCCESS":
+                    result["result"] = "SUCCESS"
+                    result["recovered"] = True
+                    result["recovery_sec"] = round(time.monotonic() - recovery_started, 2)
+                    result["duration_sec"] = round(result["duration_sec"] + result["recovery_sec"], 2)
+                    success += 1
+                    current_id = None
+                    log_jsonl(ROOT / "htg_recovery_results.jsonl", result)
+                    break
+                if outcome == "RETRY":
+                    break
+                print("화면 복귀 또는 이전 ID 확인 대기 중 — 새 환자 등록은 보류합니다.")
     finally:
         elapsed = time.monotonic() - started
-        success = sum(item is not None and item["result"] == "SUCCESS" for item in results)
         summary = {
             "requested": count,
             "attempted": len(results),
             "success": success,
             "completed": success == count,
+            "recovery_checks": recovery_checks,
             "total_sec": round(elapsed, 2),
             "average_success_sec": round(sum(item["duration_sec"] for item in results
                 if item is not None and item["result"] == "SUCCESS") / success, 2) if success else None,
@@ -797,14 +931,33 @@ def main() -> None:
     sub.add_parser("analyze", help="최신 수동 등록 로그의 클릭 순서 분석")
     runner = sub.add_parser("run", help="input()으로 인원수를 받아 순차 등록 및 OCR 검증")
     runner.add_argument("--execute", action="store_true", help="실제 등록 실행 (미지정 시 PREVIEW)")
-    runner.add_argument("--id-start", type=int, default=90001, help="독립 테스트 ID 시작값, 기본 90001")
+    runner.add_argument("--id-prefix", default=None, help="Patient ID prefix (letters/digits; prompt if omitted)")
+    runner.add_argument("--id-start", type=int, default=None, help="ID 하한값. 생략 시 저장된 시작값 사용, 최초 90001")
     runner.add_argument("--first-name", default="AUTO", help="합성 테스트 이름")
     runner.add_argument("--last-name", default="TEST", help="합성 테스트 성")
     runner.add_argument("--birth", default="", help="기본값 유지 시 생략, 예: 1986-11-12")
     runner.add_argument("--description", default="", help="미지정 시 UI 기본값 유지")
     runner.add_argument("--timeout", type=float, default=None, help="미지정 시 JSON timing.registration_timeout")
+    runner.add_argument("--stop-on-failure", action="store_true", help="첫 실패 시 중단 (기본: 목표 성공 인원까지 재시도)")
+    runner.add_argument("--retry-delay", type=float, default=1.0, help="실패 복구 재시도 간격(초), 기본 1")
     args = parser.parse_args()
+    if args.mode == "run" and (not 0 < args.retry_delay < float("inf")):
+        parser.error("--retry-delay는 0보다 큰 유한한 숫자여야 합니다.")
     count = ask_patient_count() if args.mode == "run" else None
+    if args.mode == "run":
+        if args.id_prefix is None:
+            args.id_prefix = ask_id_prefix()
+        else:
+            try:
+                validate_id_prefix(args.id_prefix)
+            except ValueError as exc:
+                parser.error(str(exc))
+        args.restart_ids = ask_restart_ids()
+        if args.id_start is None:
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.is_file() else {}
+            args.id_start = int(state.get("id_start", 90001))
+        if not 0 <= args.id_start <= 99999:
+            parser.error("--id-start는 0~99999 범위여야 합니다.")
     hwnd = find_window()
     if args.mode == "calibrate":
         calibrate(hwnd)
