@@ -31,7 +31,12 @@ CONFIG_FILE = ROOT / "htg_coordinates.json"
 STATE_FILE = ROOT / "htg_patient_id_state.json"
 EVENTS_FILE = ROOT / "htg_manual_events.jsonl"
 RUNS_FILE = ROOT / "htg_run_results.jsonl"
+DIAGNOSTICS_FILE = ROOT / "htg_search_diagnostics.jsonl"
 WINDOW_KEYWORD = "Moonlight"
+
+
+class OcrAccessError(RuntimeError):
+    """OCR temporary files remained inaccessible after retries."""
 
 
 class RetryableSetupError(RuntimeError):
@@ -205,24 +210,80 @@ def setup_ocr() -> None:
     pytesseract.get_tesseract_version()
 
 
-def ocr(hwnd: int, roi: list[int], *, digits_only: bool = False) -> str:
-    image = crop_region(hwnd, roi)
-    image = ImageOps.grayscale(image)
+def prepare_ocr_image(hwnd: int, roi: list[int]):
+    image = ImageOps.grayscale(crop_region(hwnd, roi))
     if ImageStat.Stat(image).median[0] < 128:
-        image = ImageOps.invert(image)  # Moonlight의 어두운 배경에 밝은 글자 대응
+        image = ImageOps.invert(image)
     image = ImageOps.autocontrast(image)
     image = ImageEnhance.Contrast(image).enhance(1.5)
-    image = image.resize((image.width * 3, image.height * 3))
+    return image.resize((image.width * 3, image.height * 3))
+
+
+def tesseract_call(function, image, **kwargs):
+    for attempt in range(3):
+        try:
+            return function(image, **kwargs)
+        except PermissionError as exc:
+            if attempt == 2:
+                raise OcrAccessError("Tesseract temporary file access failed after 3 attempts") from exc
+            time.sleep(0.2)
+
+
+def ocr_image(image, *, digits_only: bool = False) -> str:
     settings = "--psm 7"
     if digits_only:
         settings += " -c tessedit_char_whitelist=0123456789"
-    value = pytesseract.image_to_string(image, config=settings, lang="eng")
+    value = tesseract_call(pytesseract.image_to_string, image, config=settings, lang="eng")
     return re.sub(r"\D", "", value) if digits_only else value.strip()
 
 
+def ocr(hwnd: int, roi: list[int], *, digits_only: bool = False) -> str:
+    return ocr_image(prepare_ocr_image(hwnd, roi), digits_only=digits_only)
+
+
 def ocr_patient_id(hwnd: int, roi: list[int], pid: str) -> str:
-    """Read the complete ID when a letter prefix is present."""
-    return ocr(hwnd, roi, digits_only=pid.isdigit())
+    """Verify the prefix and the fixed five-digit suffix on one captured image."""
+    if pid.isdigit():
+        return ocr(hwnd, roi, digits_only=True)
+    image = prepare_ocr_image(hwnd, roi)
+    actual = ocr_image(image)
+    if actual == pid:
+        return actual
+    prefix, suffix = pid[:-5], pid[-5:]
+    boxes = tesseract_call(pytesseract.image_to_boxes, image, config="--psm 7", lang="eng")
+    try:
+        entries = [line.split() for line in boxes.splitlines()]
+        if len(entries) < len(prefix) + 5 or "".join(row[0] for row in entries[:len(prefix)]) != prefix:
+            return actual
+        boundary = int(entries[len(prefix) - 1][3])
+        if not 0 < boundary < image.width:
+            return actual
+        left = ocr_image(image.crop((0, 0, boundary, image.height)))
+        right = ocr_image(image.crop((boundary, 0, image.width, image.height)))
+        if left == prefix and right == suffix:
+            return pid
+    except (ValueError, IndexError):
+        pass
+    return actual
+
+
+def input_field_rois(cfg: dict) -> list[list[int]]:
+    left, top, right, bottom = cfg["input_values_roi"]
+    first_boundary = (cfg["patient_id"][0] + cfg["first_name"][0]) // 2
+    second_boundary = (cfg["first_name"][0] + cfg["last_name"][0]) // 2
+    if not left < first_boundary < second_boundary < right:
+        raise RuntimeError("Invalid input field OCR boundaries")
+    return [[left, top, first_boundary, bottom],
+            [first_boundary, top, second_boundary, bottom],
+            [second_boundary, top, right, bottom]]
+
+
+def validate_input_values(hwnd: int, cfg: dict, pid: str, first: str, last: str) -> None:
+    id_roi, first_roi, last_roi = input_field_rois(cfg)
+    actual = (ocr_patient_id(hwnd, id_roi, pid), ocr(hwnd, first_roi), ocr(hwnd, last_roi))
+    expected = (pid, first, last)
+    if actual != expected:
+        raise RuntimeError(f"Input mismatch: {actual!r} != {expected!r}")
 
 
 def contains_modal_title(hwnd: int, cfg: dict) -> bool:
@@ -500,6 +561,10 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
     status = "UNKNOWN"
     reason = ""
     actual_id = ""
+    observations = []
+    failure_stage = None
+    screenshot_path = None
+    save_attempted_at = None
     save_attempted = False
 
     try:
@@ -537,7 +602,6 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
             cfg["first_name"],
             args.first_name,
             interval=timing["typing_interval"],
-            next_field=True,
         )
 
         begin_stage('last_name')
@@ -548,7 +612,6 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
             cfg["last_name"],
             args.last_name,
             interval=timing["typing_interval"],
-            next_field=True,
         )
 
         begin_stage('birth')
@@ -589,13 +652,10 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
         # STEP 9. OK
         print("[9] OK 클릭")
         dismiss_keypad(hwnd, cfg)
-        actual = ocr(hwnd, cfg["input_values_roi"])
-        expected = f"{pid} {args.first_name} {args.last_name}"
-        actual = re.sub(r"(?<=\d)[|\]](?=\s)", "", actual)
-        if " ".join(actual.split()) != expected:
-            raise RuntimeError(f"Input mismatch: {actual!r} != {expected!r}")
+        validate_input_values(hwnd, cfg, pid, args.first_name, args.last_name)
         begin_stage("save_click")
         save_attempted = True
+        save_attempted_at = stamp()
         click(hwnd, cfg["ok"])
 
         begin_stage('verify_saved_id')
@@ -603,8 +663,6 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
         print("[10] OCR 등록 결과 확인")
 
         end = time.monotonic() + timeout
-        observations = []
-
         while time.monotonic() < end:
             # The list ID ROI is occluded by the modal. An exact reserved ID
             # match here verifies both dismissal and the saved patient.
@@ -623,6 +681,11 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
                 f"(Expected={pid}, Actual={actual_id})"
             )
 
+    except OcrAccessError:
+        status = "UNKNOWN"
+        reason = "OCR temporary file access failed"
+        raise
+
     except pag.FailSafeException:
         status = "UNKNOWN"
         reason = "PyAutoGUI FAILSAFE 중단"
@@ -634,6 +697,7 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
         print(f"ERROR: {reason}")
 
     finally:
+        failure_stage = stage_name if status != "SUCCESS" else None
         begin_stage("logging")
         if status != "SUCCESS":
             path = (
@@ -655,6 +719,12 @@ def run(hwnd: int, args, *, patient_id: str | None = None) -> dict | None:
             "result": status,
             "actual_ocr_id": actual_id,
             "save_attempted": save_attempted,
+            "save_attempted_at": save_attempted_at,
+            "pre_save_duplicate_check": "not_performed",
+            "verification_scope": "first_list_row_only",
+            "ocr_observations": observations,
+            "failure_stage": failure_stage,
+            "screenshot_path": screenshot_path,
             "stages_sec": stage_times,
             "duration_sec": round(
                 time.monotonic() - began,
@@ -729,10 +799,11 @@ def recover_registration(hwnd: int, cfg: dict, result: dict) -> str:
         if result.get("save_attempted", False):
             # Retry submission of the same verified ID, never allocate a second
             # ID while an earlier save is unresolved.
-            actual = ocr(hwnd, cfg["input_values_roi"])
-            actual = re.sub(r"(?<=\d)[|\]](?=\s)", "", actual)
-            expected = f"{pid} {result['first_name']} {result['last_name']}"
-            if " ".join(actual.split()) != expected:
+            try:
+                validate_input_values(hwnd, cfg, pid, result["first_name"], result["last_name"])
+            except OcrAccessError:
+                raise
+            except RuntimeError:
                 return "WAIT"
             click(hwnd, cfg["ok"])
             saved = wait_until(
@@ -808,7 +879,7 @@ def run_batch(hwnd: int, args, count: int) -> dict:
                 recovery_checks += 1
                 try:
                     outcome = recover_registration(hwnd, cfg, result)
-                except pag.FailSafeException:
+                except (pag.FailSafeException, OcrAccessError):
                     raise
                 except Exception as exc:
                     print(f"복구 재시도: {exc}")
@@ -920,12 +991,86 @@ def screen(hwnd: int) -> None:
     print("ROI 형식: [left, top, right, bottom] (스크린샷 기준 픽셀)")
 
 
+def search_diagnostic(hwnd: int, args) -> dict:
+    """Capture search input and result evidence; never classify an ID as absent."""
+    cfg = load_config(hwnd)
+    _, _, width, height = client_rect(hwnd)
+    if cfg.get("client_size") not in (None, [width, height]):
+        raise RuntimeError("Moonlight client size differs from configuration")
+    x, y = args.search_point
+    if not (0 <= x < width and 0 <= y < height):
+        raise ValueError("Search point is outside the client area")
+    for name, roi in (("search_roi", args.search_roi), ("results_roi", args.results_roi)):
+        left, top, right, bottom = roi
+        if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+            raise ValueError(f"{name} is outside the client area")
+    validate_id_prefix(args.patient_id)
+    if not args.patient_id:
+        raise ValueError("Patient ID must not be empty")
+    setup_ocr()
+    if win32gui.GetForegroundWindow() != hwnd:
+        pag.press("alt")
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.3)
+    if win32gui.GetForegroundWindow() != hwnd:
+        raise RuntimeError("Moonlight window is not active")
+    if "PATIENTLIST" not in re.sub(r"[^A-Z]", "", ocr(hwnd, cfg["list_title_roi"]).upper()):
+        raise RuntimeError("Patient list could not be confirmed")
+
+    record = {"patient_id": args.patient_id, "search_point": args.search_point,
+              "search_roi": args.search_roi, "results_roi": args.results_roi,
+              "focus": "unverified", "input_ocr": None, "results_ocr": None,
+              "status": "started", "screenshot_path": None, "started_at": stamp(),
+              "foreground_window_matches": win32gui.GetForegroundWindow() == hwnd}
+    stage = "focus_and_input"
+    try:
+        record["input_started_at"] = stamp()
+        type_text(hwnd, args.search_point, args.patient_id, interval=get_timing(cfg)["typing_interval"])
+        record["input_finished_at"] = stamp()
+        time.sleep(args.wait)
+        stage = "input_ocr"
+        record["input_ocr"] = ocr(hwnd, args.search_roi)
+        record["input_observed_at"] = stamp()
+        if record["input_ocr"] != args.patient_id:
+            record["status"] = "input_unverified"
+            return record
+        stage = "results_ocr"
+        image = prepare_ocr_image(hwnd, args.results_roi)
+        record["results_observed_at"] = stamp()
+        record["results_ocr"] = tesseract_call(
+            pytesseract.image_to_string, image, config="--psm 6", lang="eng").strip()
+        record["status"] = "observed_unverified"
+        return record
+    except Exception as exc:
+        record["status"] = "error"
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        record["stage"] = stage
+        record["finished_at"] = stamp()
+        path = ROOT / f"htg_search_diagnostic_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
+        try:
+            screenshot_client(hwnd, path)
+            record["screenshot_path"] = str(path)
+        except Exception as exc:
+            record["screenshot_error"] = f"{type(exc).__name__}: {exc}"
+        log_jsonl(DIAGNOSTICS_FILE, record)
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+        print("Diagnostic only: search results do not prove presence or absence.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HTG Moonlight 환자 n명 등록 자동화")
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("calibrate", help="기존 수동 좌표 보정 (선택 사항)")
     sub.add_parser("screen", help="Moonlight 클라이언트 영역 캡처 및 크기 확인")
     sub.add_parser("input-test", help="저장 없이 First Name 필드 키보드 전송 시험")
+    diagnostic = sub.add_parser("search-diagnostic", help="Inspect search input and OCR results without registration")
+    diagnostic.add_argument("patient_id", help="Synthetic patient ID to search")
+    diagnostic.add_argument("--search-point", nargs=2, type=int, required=True, metavar=("X", "Y"))
+    diagnostic.add_argument("--search-roi", nargs=4, type=int, required=True, metavar=("L", "T", "R", "B"))
+    diagnostic.add_argument("--results-roi", nargs=4, type=int, required=True, metavar=("L", "T", "R", "B"))
+    diagnostic.add_argument("--wait", type=float, default=1.0, help="Seconds to wait for search response")
     recorder = sub.add_parser("record", help="수동 등록 1회 조작 이벤트 기록")
     recorder.add_argument("--capture-text", action="store_true", help="합성 테스트 데이터만 입력할 때 사용")
     sub.add_parser("analyze", help="최신 수동 등록 로그의 클릭 순서 분석")
@@ -943,6 +1088,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode == "run" and (not 0 < args.retry_delay < float("inf")):
         parser.error("--retry-delay는 0보다 큰 유한한 숫자여야 합니다.")
+    if args.mode == "search-diagnostic" and not 0 < args.wait < float("inf"):
+        parser.error("--wait must be a positive finite number")
     count = ask_patient_count() if args.mode == "run" else None
     if args.mode == "run":
         if args.id_prefix is None:
@@ -965,6 +1112,8 @@ def main() -> None:
         screen(hwnd)
     elif args.mode == "input-test":
         input_test(hwnd)
+    elif args.mode == "search-diagnostic":
+        search_diagnostic(hwnd, args)
     elif args.mode == "record":
         record(hwnd, capture_text=args.capture_text)
     elif args.mode == "analyze":

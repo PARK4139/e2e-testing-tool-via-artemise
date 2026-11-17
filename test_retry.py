@@ -82,7 +82,8 @@ class RetryTests(unittest.TestCase):
     def test_submitted_modal_retries_same_id_without_cancel(self):
         cfg = dict(list_first_id_roi=[], input_values_roi=[], ok=[1009, 384], cancel=[855, 384])
         with patch.object(app.win32gui, "GetForegroundWindow", return_value=1), \
-             patch.object(app, "ocr", side_effect=["", "90040 AUTO TEST"]), \
+             patch.object(app, "ocr", return_value=""), \
+             patch.object(app, "validate_input_values"), \
              patch.object(app, "contains_modal_title", return_value=True), \
              patch.object(app, "dismiss_keypad"), patch.object(app, "wait_until", return_value=True), \
              patch.object(app, "click") as click:
@@ -120,9 +121,61 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(app.validate_id_prefix("Ab12"), "Ab12")
         with self.assertRaises(ValueError):
             app.validate_id_prefix("A-B")
-        with patch.object(app, "ocr", return_value="Ab1200001") as ocr:
+        with patch.object(app, "prepare_ocr_image"), patch.object(app, "ocr_image", return_value="Ab1200001"):
             self.assertEqual(app.ocr_patient_id(1, [], "Ab1200001"), "Ab1200001")
-            ocr.assert_called_once_with(1, [], digits_only=False)
+
+    def test_ocr_permission_retries_and_stops(self):
+        with patch.object(app.time, "sleep"), self.assertRaises(app.OcrAccessError):
+            app.tesseract_call(lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError()), None)
+
+    def test_input_values_reject_wrong_field(self):
+        cfg = {"input_values_roi": [0, 0, 300, 50], "patient_id": [50, 25],
+               "first_name": [150, 25], "last_name": [250, 25]}
+        with patch.object(app, "ocr_patient_id", return_value="NEW00000"), \
+             patch.object(app, "ocr", side_effect=["AUTO", "WRONG"]):
+            with self.assertRaises(RuntimeError):
+                app.validate_input_values(1, cfg, "NEW00000", "AUTO", "TEST")
+
+    def test_search_diagnostic_stops_on_input_mismatch(self):
+        args = SimpleNamespace(patient_id="n00001", search_point=[20, 20],
+                               search_roi=[0, 0, 100, 40], results_roi=[0, 40, 100, 90], wait=0.1)
+        cfg = {"client_size": [100, 100], "list_title_roi": [0, 0, 100, 20]}
+        with ExitStack() as stack:
+            stack.enter_context(redirect_stdout(StringIO()))
+            stack.enter_context(patch.object(app, "load_config", return_value=cfg))
+            stack.enter_context(patch.object(app, "client_rect", return_value=(0, 0, 100, 100)))
+            stack.enter_context(patch.object(app, "setup_ocr"))
+            stack.enter_context(patch.object(app.win32gui, "GetForegroundWindow", return_value=1))
+            stack.enter_context(patch.object(app, "ocr", side_effect=["PATIENT LIST", ""]))
+            stack.enter_context(patch.object(app, "type_text"))
+            stack.enter_context(patch.object(app.time, "sleep"))
+            stack.enter_context(patch.object(app, "screenshot_client"))
+            log = stack.enter_context(patch.object(app, "log_jsonl"))
+            result = app.search_diagnostic(1, args)
+            self.assertEqual(result["status"], "input_unverified")
+            self.assertIsNone(result["results_ocr"])
+            self.assertEqual(log.call_args.args[1]["stage"], "input_ocr")
+
+    def test_search_diagnostic_never_calls_empty_results_absent(self):
+        args = SimpleNamespace(patient_id="n00001", search_point=[20, 20],
+                               search_roi=[0, 0, 100, 40], results_roi=[0, 40, 100, 90], wait=0.1)
+        cfg = {"client_size": [100, 100], "list_title_roi": [0, 0, 100, 20]}
+        with ExitStack() as stack:
+            stack.enter_context(redirect_stdout(StringIO()))
+            stack.enter_context(patch.object(app, "load_config", return_value=cfg))
+            stack.enter_context(patch.object(app, "client_rect", return_value=(0, 0, 100, 100)))
+            stack.enter_context(patch.object(app, "setup_ocr"))
+            stack.enter_context(patch.object(app.win32gui, "GetForegroundWindow", return_value=1))
+            stack.enter_context(patch.object(app, "ocr", side_effect=["PATIENT LIST", "n00001"]))
+            stack.enter_context(patch.object(app, "type_text"))
+            stack.enter_context(patch.object(app.time, "sleep"))
+            stack.enter_context(patch.object(app, "screenshot_client"))
+            stack.enter_context(patch.object(app, "log_jsonl"))
+            stack.enter_context(patch.object(app, "prepare_ocr_image"))
+            stack.enter_context(patch.object(app, "tesseract_call", return_value=""))
+            result = app.search_diagnostic(1, args)
+            self.assertEqual(result["status"], "observed_unverified")
+            self.assertEqual(result["results_ocr"], "")
 
     def test_ask_restart_ids_prompts(self):
         with redirect_stdout(StringIO()), patch("builtins.input", side_effect=["", "n", "NO", "y", "YES", "invalid", "y"]):
