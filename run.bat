@@ -1,0 +1,1 @@
+uv run python add_1000_patient_info.py run --execute
