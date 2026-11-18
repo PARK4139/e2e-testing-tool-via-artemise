@@ -45,95 +45,14 @@ $env:TESSERACT_CMD = 'D:\Tools\Tesseract-OCR\tesseract.exe'
 
 ## Quick Start Guide
 
-> **사용자 스토리:** HTG 테스트 담당자로서 반복 입력을 줄이기 위해 합성 환자 1,000명을 등록하고, 목표 건수가 확인되었는지 결과 로그로 확인하고 싶습니다.
-
-환경을 준비하고 1명을 시험 등록한 뒤, 나머지 999명을 등록합니다. 예시는 기존에 사용하지 않은 접두어 `QADEMO`를 사용한다고 가정합니다. 이미 같은 ID가 있다면 다른 접두어를 선택합니다.
-
-### 1. 처음 실행할 환경 준비하기
-
-위의 [실행 환경 및 설치](#실행-환경-및-설치)에 따라 설치를 마치고 PowerShell에서 저장소 폴더를 엽니다. 이후 명령은 모두 이 폴더에서 실행합니다.
-
-Moonlight에서 HTG에 접속하고 `PATIENT LIST` 화면을 엽니다. 창은 최소화하거나 다른 창으로 가리지 않습니다.
-
-```powershell
-uv run python add_1000_patient_info.py screen
-```
-
-출력된 클라이언트 크기와 저장된 PNG를 확인합니다. 포함된 좌표는 **1280 × 720** 기준입니다. 현재 화면의 버튼·입력칸·OCR 영역과 `htg_coordinates.json`이 맞아야 합니다. 다르면 [좌표 및 OCR 설정](#좌표-및-ocr-설정)을 먼저 진행합니다. `calibrate`만으로는 필수 설정이 완성되지 않습니다.
-
-**완료 기준:** 화면 캡처에 환자 목록이 보이고, 창 크기와 설정된 좌표·OCR 영역이 현재 화면에 맞습니다.
-
-### 2. 저장 없이 입력 전달 확인하기
-
-HTG에서 직접 Add Patient를 눌러 `NEW PATIENT` 모달을 연 뒤 실행합니다.
-
-```powershell
-uv run python add_1000_patient_info.py input-test
-```
-
-First Name에 `AUTO`가 표시되는지 확인하고 **Cancel**로 닫아 `PATIENT LIST`로 돌아갑니다. 이 명령은 환자를 저장하거나 ID를 예약하지 않습니다.
-
-**완료 기준:** 올바른 입력칸에 `AUTO`가 표시됩니다. 다른 칸에 입력되면 좌표를 수정한 뒤 다시 확인합니다.
-
-### 3. 등록 계획 미리 확인하기
-
-```powershell
-uv run python add_1000_patient_info.py run --id-prefix QADEMO
-```
-
-질문에 다음과 같이 답합니다.
-
-```text
-등록할 환자 수 n: 1
-ID를 00000부터 다시 시작할까요? [y/N]: y
-```
-
-출력에서 `ID=QADEMO00000`과 `PREVIEW: 실제 등록 없음`을 확인합니다. PREVIEW는 계획만 출력하며 전체 화면 동작이나 OCR 성공을 시험하지는 않습니다. 여기서 선택한 재시작 여부는 다음 실행에 자동 적용되지 않습니다.
-
-**완료 기준:** 첫 ID와 기본 이름 `AUTO`, 성 `TEST`가 의도한 값입니다.
-
-### 4. 환자 1명 시험 등록하기
-
-```powershell
-uv run python add_1000_patient_info.py run --execute --id-prefix QADEMO --stop-on-failure
-```
-
-인원수에 `1`, 재시작 여부에 `y`를 입력합니다. 도구가 입력·검증·저장하는 동안 화면 조작을 맡깁니다.
-
-종료 후 화면과 마지막 배치 결과를 확인합니다.
-
-```powershell
-Get-Content .\htg_batch_results.jsonl -Tail 1
-```
-
-**완료 기준:** 환자 목록 첫 행에 `QADEMO00000`이 보이고, 배치 결과의 `requested: 1`, `success: 1`, `completed: true`가 확인됩니다. 실패했다면 [복구와 중단](#복구와-중단) 및 로그를 확인하고 원인을 해결한 뒤 진행합니다.
-
-### 5. 같은 번호 흐름으로 나머지 999명 등록하기
-
-시험 등록이 성공했다면 같은 접두어로 실행합니다.
-
-```powershell
-uv run python add_1000_patient_info.py run --execute --id-prefix QADEMO
-```
-
-```text
-등록할 환자 수 n: 999
-ID를 00000부터 다시 시작할까요? [y/N]: n
-```
-
-위 시험 이후 다른 실행이나 상태 변경이 없었다면 `QADEMO00001`부터 `QADEMO00999`까지 진행합니다. **이번에는 재시작하지 않아야** 시험 등록의 다음 번호를 이어갑니다. 기본 동작은 목표 성공 건수까지 같은 ID로 복구·재시도하며, 진행을 중단하려면 Ctrl+C를 누릅니다.
-
-```powershell
-Get-Content .\htg_batch_results.jsonl -Tail 1
-```
-
-**완료 기준:** 두 번째 배치 결과가 `requested: 999`, `success: 999`, `completed: true`입니다. 첫 시험 1건을 합쳐 도구가 확인한 성공은 1,000건입니다. 이는 첫 행 OCR 확인 건수이며, 등록 전 부재나 전체 목록의 신규 환자 1,000명을 보증하는 값은 아닙니다.
-
-### 다음 작업에서 이어서 사용하기
-
-같은 접두어로 실행하고 재시작 질문에 `n`을 선택하면 마지막 예약 번호 다음부터 이어갑니다. `run.bat`을 실행해 인원수·접두어·재시작 여부를 차례로 입력할 수도 있습니다.
-
-중단된 작업은 마지막 ID의 실제 저장 여부부터 확인합니다. 번호 상태만으로 미확정 등록이 자동 복구되지는 않습니다. 인원수와 재시작 여부는 현재 명령행 옵션이 없어 대화형 입력이 필요합니다.
+1. 위의 설치 명령을 실행하고 PowerShell에서 저장소 폴더를 엽니다.
+2. Moonlight에서 HTG의 `PATIENT LIST`를 열고 창의 클라이언트 영역을 1280 × 720으로 맞춥니다.
+3. `htg_coordinates.json`의 클릭 좌표와 OCR 영역을 현재 화면에 맞춥니다([설정 방법](#좌표-및-ocr-설정)).
+4. `uv run python add_1000_patient_info.py run --execute --stop-on-failure`를 실행합니다.
+5. 등록할 인원수에 `1`, 접두어에 사용하지 않은 영문·숫자 조합(예: `QADEMO`), 재시작 여부에 `y`를 입력합니다.
+6. 목록 첫 행에 `QADEMO00000`이 표시되고 결과에 `success: 1`, `completed: true`가 나오는지 확인합니다.
+7. `uv run python add_1000_patient_info.py run --execute`를 실행하고 인원수 `999`, 같은 접두어 `QADEMO`, 재시작 여부 `n`을 입력합니다.
+8. 결과에 `success: 999`, `completed: true`가 나오면 완료입니다. 도중에 중단하려면 Ctrl+C를 누릅니다.
 
 ### ID 발급 규칙
 
